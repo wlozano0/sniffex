@@ -206,6 +206,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <unistd.h>
+#include <time.h>
 
 /* default snap length (maximum bytes per packet to capture) */
 #define SNAP_LEN 1518
@@ -215,6 +217,21 @@
 
 /* Ethernet addresses are 6 bytes */
 #define ETHER_ADDR_LEN	6
+
+#define DIRECTION_IN 1
+#define DIRECTION_OUT 2
+
+#define HTTP 1
+#define HTTPS 2
+#define POP3 3
+#define SMTP 4
+#define FTP 5
+#define ADB 6
+#define OTHER 99
+
+#define STATS_TABLE_SIZE 20
+
+#define TIME_STATS 5
 
 /* Ethernet header */
 struct sniff_ethernet {
@@ -266,6 +283,25 @@ struct sniff_tcp {
         u_short th_sum;                 /* checksum */
         u_short th_urp;                 /* urgent pointer */
 };
+
+struct sniff_udp {
+        u_short th_sport;               /* source port */
+        u_short th_dport;               /* destination port */
+        u_short size;                   /* size */
+        u_short checksum;               /* chechsum */
+};
+
+struct stats{
+    int valid;
+    int direction;
+    int protocol5;
+    int packet_count;
+    int total_size;
+};
+ 
+/* Global vars */
+struct in_addr local_address;
+struct stats stats_table[STATS_TABLE_SIZE];
 
 void
 got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
@@ -417,22 +453,29 @@ return;
 void
 got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet)
 {
-
-	static int count = 1;                   /* packet counter */
-	
 	/* declare pointers to packet headers */
 	const struct sniff_ethernet *ethernet;  /* The ethernet header [1] */
 	const struct sniff_ip *ip;              /* The IP header */
 	const struct sniff_tcp *tcp;            /* The TCP header */
+	const struct sniff_udp *udp;            /* The TCP header */
 	const char *payload;                    /* Packet payload */
+    char ip_src[20];
+    char ip_dst[20];
 
 	int size_ip;
 	int size_tcp;
 	int size_payload;
-	
-	printf("\nPacket number %d:\n", count);
-	count++;
-	
+
+	static time_t base_time = 0;
+
+	int direction;
+	int packet_size;
+	int protocol5;
+	int i;
+
+	if (base_time == 0)
+		base_time = time(NULL);
+
 	/* define ethernet header */
 	ethernet = (struct sniff_ethernet*)(packet);
 	
@@ -444,58 +487,125 @@ got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet)
 		return;
 	}
 
-	/* print source and destination IP addresses */
-	printf("       From: %s\n", inet_ntoa(ip->ip_src));
-	printf("         To: %s\n", inet_ntoa(ip->ip_dst));
-	
+	/* Prepare src and dst ip address as string */
+	memset(ip_src, 0, 20);
+	memset(ip_dst, 0, 20);
+	strncpy(ip_src, inet_ntoa(ip->ip_src), 16);
+	strncpy(ip_dst, inet_ntoa(ip->ip_dst), 16);
+
+	direction = DIRECTION_IN;
+	if (memcmp((void*)&ip->ip_src, (void*)&local_address, sizeof(ip->ip_src))){
+		direction = DIRECTION_OUT;
+	}
+
+	packet_size = header->caplen;
+
+	protocol5 = OTHER;
+
 	/* determine protocol */	
 	switch(ip->ip_p) {
 		case IPPROTO_TCP:
-			printf("   Protocol: TCP\n");
+			/*
+			 *  OK, this packet is TCP.
+			 */
+
+			/* define/compute tcp header offset */
+			tcp = (struct sniff_tcp*)(packet + SIZE_ETHERNET + size_ip);
+			size_tcp = TH_OFF(tcp)*4;
+			if (size_tcp < 20) {
+				printf("   * Invalid TCP header length: %u bytes\n", size_tcp);
+				return;
+			}
+
+			if (ntohs(tcp->th_sport) == 80 || ntohs(tcp->th_dport) == 80)
+				protocol5 = HTTP;
+			else if (ntohs(tcp->th_sport) == 443 || ntohs(tcp->th_dport) == 443)
+				protocol5 = HTTPS;
+			else if (ntohs(tcp->th_sport) == 21 || ntohs(tcp->th_dport) == 21)
+				protocol5 = FTP;
+			else if (ntohs(tcp->th_sport) == 25 || ntohs(tcp->th_dport) == 25)
+				protocol5 = SMTP;
+			else if (ntohs(tcp->th_sport) == 110 || ntohs(tcp->th_dport) == 110)
+				protocol5 = POP3;
+
+			//printf("%d %s %s TCP %d %d %d %d\n", direction, ip_src, ip_dst, ntohs(tcp->th_sport), ntohs(tcp->th_dport), protocol5, packet_size);
+			break;
+
+			/* define/compute tcp payload (segment) offset */
+			payload = (u_char *)(packet + SIZE_ETHERNET + size_ip + size_tcp);
+
+			/* compute tcp payload (segment) size */
+			size_payload = ntohs(ip->ip_len) - (size_ip + size_tcp);
+
+			/*
+			 * Print payload data; it might be binary, so don't just
+			 * treat it as a string.
+			 */
+			printf("%d %s %s TCP %d %d %d\n", direction, ip_src, ip_dst, ntohs(tcp->th_sport), ntohs(tcp->th_dport), packet_size);
 			break;
 		case IPPROTO_UDP:
-			printf("   Protocol: UDP\n");
-			return;
+			break;
+			/*
+			 *  OK, this packet is UCP.
+			 */
+
+			/* define/compute tcp header offset */
+			udp = (struct sniff_udp*)(packet + SIZE_ETHERNET + size_ip);
+			size_payload = ntohs(udp->size);
+
+			/*
+			 * Print payload data; it might be binary, so don't just
+			 * treat it as a string.
+			 */
+			printf("%d %s %s UDP %d %d %d\n", direction, ip_src, ip_dst, ntohs(udp->th_sport), ntohs(udp->th_dport), packet_size);
+			break;
 		case IPPROTO_ICMP:
-			printf("   Protocol: ICMP\n");
-			return;
+			break;
+			printf("%d %s %s ICMP\n", direction, ip_src, ip_dst);
+			break;
 		case IPPROTO_IP:
-			printf("   Protocol: IP\n");
-			return;
+			break;
+			printf("IP\n");
+			break;
 		default:
-			printf("   Protocol: unknown\n");
-			return;
+			break;
+			printf("unknown\n");
+			break;
 	}
 	
-	/*
-	 *  OK, this packet is TCP.
-	 */
-	
-	/* define/compute tcp header offset */
-	tcp = (struct sniff_tcp*)(packet + SIZE_ETHERNET + size_ip);
-	size_tcp = TH_OFF(tcp)*4;
-	if (size_tcp < 20) {
-		printf("   * Invalid TCP header length: %u bytes\n", size_tcp);
-		return;
+	//printf("%d %d %d\n", direction, protocol5, packet_size);
+
+	for (i=0; i<STATS_TABLE_SIZE; i++){
+		if (stats_table[i].valid == 1 && stats_table[i].direction == direction && stats_table[i].protocol5 == protocol5){
+			stats_table[i].packet_count++;
+			stats_table[i].total_size += packet_size;
+			break;
+		}
+
+		if (stats_table[i].valid == 0){
+			stats_table[i].valid = 1;
+			stats_table[i].direction = direction;
+			stats_table[i].protocol5 = protocol5;
+			stats_table[i].packet_count = 0;
+			stats_table[i].total_size = packet_size;
+			break;
+		}
 	}
-	
-	printf("   Src port: %d\n", ntohs(tcp->th_sport));
-	printf("   Dst port: %d\n", ntohs(tcp->th_dport));
-	
-	/* define/compute tcp payload (segment) offset */
-	payload = (u_char *)(packet + SIZE_ETHERNET + size_ip + size_tcp);
-	
-	/* compute tcp payload (segment) size */
-	size_payload = ntohs(ip->ip_len) - (size_ip + size_tcp);
-	
-	/*
-	 * Print payload data; it might be binary, so don't just
-	 * treat it as a string.
-	 */
-	if (size_payload > 0) {
-		printf("   Payload (%d bytes):\n", size_payload);
-		print_payload(payload, size_payload);
+
+	if (time(NULL) - base_time > TIME_STATS){
+		for (i=0; i<STATS_TABLE_SIZE; i++){
+			if (stats_table[i].valid != 1)
+				continue;
+			printf("stats %d %d %d %d\n", stats_table[i].direction, stats_table[i].protocol5, stats_table[i].packet_count, stats_table[i].total_size);
+			stats_table[i].valid = 0;
+			stats_table[i].direction = 0;
+			stats_table[i].protocol5 = 0;
+			stats_table[i].packet_count = 0;
+			stats_table[i].total_size = 0;
+		}
+		base_time = time(NULL);
 	}
+
 
 return;
 }
@@ -511,7 +621,13 @@ int main(int argc, char **argv)
 	struct bpf_program fp;			/* compiled filter program (expression) */
 	bpf_u_int32 mask;			/* subnet mask */
 	bpf_u_int32 net;			/* ip */
-	int num_packets = 10;			/* number of packets to capture */
+	int num_packets = 0;			/* number of packets to capture */
+	pcap_if_t *d;
+	pcap_if_t *alldevs;
+	pcap_addr_t *a;
+	int status;
+
+	memset(stats_table, 0, sizeof(stats_table));
 
 	print_app_banner();
 
@@ -542,10 +658,29 @@ int main(int argc, char **argv)
 		mask = 0;
 	}
 
+	status = pcap_findalldevs(&alldevs, errbuf);
+	if(status != 0) {
+		printf("%s\n", errbuf);
+		return 1;
+	}
+
+	for(d=alldevs; d!=NULL; d=d->next) {
+		if (strcmp(dev, d->name))
+			continue;
+		for(a=d->addresses; a!=NULL; a=a->next) {
+			if(a->addr->sa_family == AF_INET){
+				local_address = ((struct sockaddr_in*)a->addr)->sin_addr;
+			}
+		}
+	}
+
+	pcap_freealldevs(alldevs);
+
 	/* print capture info */
 	printf("Device: %s\n", dev);
-	printf("Number of packets: %d\n", num_packets);
+	printf("Address: %s\n", inet_ntoa(local_address));
 	printf("Filter expression: %s\n", filter_exp);
+
 
 	/* open capture device */
 	handle = pcap_open_live(dev, SNAP_LEN, 1, 1000, errbuf);
@@ -576,6 +711,11 @@ int main(int argc, char **argv)
 
 	/* now we can set our callback function */
 	pcap_loop(handle, num_packets, got_packet, NULL);
+
+
+	while (1){
+		sleep(1);
+	}
 
 	/* cleanup */
 	pcap_freecode(&fp);
